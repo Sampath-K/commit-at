@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Badge,
@@ -140,26 +140,30 @@ export function CascadeView({
   });
 
   // ── Fetch cascade on mount ────────────────────────────────────────────────
-  // Using useEffect-style fetch but kept inline to avoid extra deps
-  if (!loading && !cascadeData && !error) {
-    setLoading(true);
-    void fetchCascade();
-  }
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchCascade(controller.signal);
+    return () => controller.abort();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [commitment.id, userId]);
 
-  async function fetchCascade(): Promise<void> {
+  async function fetchCascade(signal?: AbortSignal): Promise<void> {
+    setLoading(true);
     try {
       const params = new URLSearchParams({
         rootTaskId: commitment.id,
         userId,
         slipDays: '1',
       });
-      const res  = await fetch(`${API_BASE}/api/v1/graph/cascade?${params}`, { method: 'POST' });
+      const res  = await fetch(`${API_BASE}/api/v1/graph/cascade?${params}`, { method: 'POST', signal });
+      if (signal?.aborted) return;
       const json = (await res.json()) as CascadeApiResponse;
       setCascadeData(json);
-    } catch {
+    } catch (err) {
+      if (signal?.aborted || (err instanceof DOMException && err.name === 'AbortError')) return;
       setError(t('app.error.generic'));
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) setLoading(false);
     }
   }
 

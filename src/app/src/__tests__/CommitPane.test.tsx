@@ -68,6 +68,11 @@ jest.mock('../config/psychology.config', () => ({
   SPRING_CONFIGS: { smooth: {}, gentle: {}, bounce: {} },
   STAGGER_DELAYS:  { cascadeItems: 0 },
 }));
+jest.mock('../config/api.config', () => ({ API_BASE: 'https://test-api.example.com' }));
+// Mock React Query hooks used by psychology sub-components so tests don't need QueryClientProvider
+jest.mock('../hooks/useDeliveryScore', () => ({ useDeliveryScore: () => ({ data: undefined }) }));
+jest.mock('../hooks/useStreak',        () => ({ useStreak:        () => ({ data: undefined }) }));
+jest.mock('../hooks/useCompetencyLevel', () => ({ useCompetencyLevel: () => ({ level: 1, xp: 0, nextLevelXp: 100 }) }));
 
 // ─── Loading state ────────────────────────────────────────────────────────────
 
