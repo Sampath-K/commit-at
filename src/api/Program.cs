@@ -1,7 +1,9 @@
 using System.Text;
 using System.Text.Json;
+using Azure.AI.OpenAI;
 using Azure.Data.AppConfiguration;
 using Azure.Data.Tables;
+using OpenAI.Chat;
 using CommitApi.Agents;
 using CommitApi.Auth;
 using CommitApi.Capacity;
@@ -12,6 +14,7 @@ using CommitApi.Extractors;
 using CommitApi.Graph;
 using CommitApi.Models;
 using CommitApi.Models.Agents;
+using CommitApi.Models.Feedback;
 using CommitApi.Models.Extraction;
 using CommitApi.Replan;
 using CommitApi.Repositories;
@@ -38,6 +41,10 @@ var tableClient = new TableClient(storageConn, "commitments");
 await tableClient.CreateIfNotExistsAsync();
 builder.Services.AddSingleton(tableClient);
 builder.Services.AddSingleton<ICommitmentRepository, CommitmentRepository>();
+
+var feedbackTableClient = new TableClient(storageConn, "feedback");
+await feedbackTableClient.CreateIfNotExistsAsync();
+builder.Services.AddSingleton<IFeedbackRepository>(_ => new FeedbackRepository(feedbackTableClient));
 
 // ─── Auth (MSAL OBO + Graph) ───────────────────────────────────────────────────
 builder.Services.AddAuthentication(Microsoft.AspNetCore.Authentication.JwtBearer.JwtBearerDefaults.AuthenticationScheme)
@@ -106,6 +113,9 @@ builder.Services.AddSingleton<ITeamsMessageSender,  TeamsMessageSender>();
 
 // ─── Motivation Service (T-034) ────────────────────────────────────────────────
 builder.Services.AddSingleton<IMotivationService, MotivationService>();
+
+// ─── Signal Profile Service (feedback-driven extraction tuning) ───────────────
+builder.Services.AddSingleton<ISignalProfileService, SignalProfileService>();
 
 // ─── Feature Flags ─────────────────────────────────────────────────────────────
 ConfigurationClient? appConfigClient = appConfigConn is not null
@@ -809,6 +819,235 @@ api.MapPost("/approvals", async (
     });
 })
 .WithName("HandleApproval")
+.WithOpenApi();
+
+// POST /api/v1/commitments/{id}/feedback — thumbs up/down on an extracted task
+api.MapPost("/commitments/{id}/feedback", async (
+    string              id,
+    HttpContext         http,
+    ICommitmentRepository repo,
+    IFeedbackRepository feedbackRepo,
+    ISignalProfileService signalProfile,
+    IAppInsightsClient  insights) =>
+{
+    var userId = http.Request.Query["userId"].ToString();
+    if (string.IsNullOrEmpty(userId))
+        throw new ValidationException("userId query parameter is required");
+
+    FeedbackRequest? req;
+    try { req = await http.Request.ReadFromJsonAsync<FeedbackRequest>(); }
+    catch { throw new ValidationException("Request body must be a valid FeedbackRequest JSON object"); }
+
+    if (req is null || string.IsNullOrEmpty(req.CommitmentId))
+        throw new ValidationException("commitmentId is required");
+
+    var entity = await repo.GetAsync(userId, id);
+    if (entity is null)
+        throw new NotFoundException($"Commitment {id} not found");
+
+    var titleFingerprint = ExtractionOrchestrator.ComputeTitleFingerprint(entity.Title ?? "");
+    var commitmentIdHash = Convert.ToHexString(
+        System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(id)))[..16];
+
+    var feedbackEntity = new FeedbackEntity
+    {
+        PartitionKey          = PiiScrubber.HashValue(userId),
+        RowKey                = Guid.NewGuid().ToString(),
+        CommitmentIdHash      = commitmentIdHash,
+        TitleFingerprint      = titleFingerprint,
+        FeedbackType          = req.Type.ToString(),
+        SourceType            = entity.SourceType ?? "",
+        RecordedAt            = DateTimeOffset.UtcNow,
+        ConfidenceAtFeedback  = 0.0,
+        Comment               = req.Comment?.Trim().Length > 0 ? req.Comment.Trim() : null,
+    };
+
+    await feedbackRepo.RecordAsync(feedbackEntity);
+
+    if (req.Type is FeedbackType.FalsePositive or FeedbackType.Duplicate)
+    {
+        entity.Status       = "dismissed";
+        entity.LastActivity = DateTimeOffset.UtcNow;
+        await repo.UpsertAsync(entity);
+    }
+
+    signalProfile.InvalidateCache(userId);
+
+    insights.TrackUserAction("task-feedback", PiiScrubber.HashValue(userId), "feedback",
+        new Dictionary<string, string>
+        {
+            ["type"]       = req.Type.ToString(),
+            ["sourceType"] = entity.SourceType ?? "",
+        });
+
+    return Results.Ok(new { success = true, requestId = http.TraceIdentifier });
+})
+.WithName("RecordFeedback")
+.WithOpenApi();
+
+// GET /api/v1/admin/metrics — aggregated KPIs for the admin dashboard
+api.MapGet("/admin/metrics", async (
+    ICommitmentRepository repo,
+    IFeedbackRepository   feedbackRepo,
+    IAppInsightsClient    insights) =>
+{
+    var statsTask = feedbackRepo.GetAdminStatsAsync();
+    var countTask = repo.CountAllAsync();
+    await Task.WhenAll(statsTask, countTask);
+
+    var (totalFeedback, falsePositives, avgConfidence) = statsTask.Result;
+    var totalCommitments  = countTask.Result;
+    var falsePositiveRate = totalFeedback > 0 ? (double)falsePositives / totalFeedback : 0.0;
+
+    insights.TrackUserAction("admin-metrics-viewed", "admin", "admin", new Dictionary<string, string>());
+
+    return Results.Ok(new
+    {
+        success = true,
+        data = new { totalCommitments, totalFeedback, avgConfidence, falsePositiveRate },
+        generatedAt = DateTimeOffset.UtcNow,
+        requestId   = Guid.NewGuid(),
+    });
+})
+.WithName("GetAdminMetrics")
+.WithOpenApi();
+
+// GET /api/v1/admin/feedback — paginated list of feedback events for admin review
+api.MapGet("/admin/feedback", async (
+    HttpContext         http,
+    IFeedbackRepository feedbackRepo) =>
+{
+    var typeFilter   = http.Request.Query["type"].FirstOrDefault();
+    var sourceFilter = http.Request.Query["source"].FirstOrDefault();
+    var limitStr     = http.Request.Query["limit"].FirstOrDefault();
+    var limit        = int.TryParse(limitStr, out var l) ? Math.Clamp(l, 1, 500) : 200;
+
+    var rows    = await feedbackRepo.GetRecentAsync(typeFilter, sourceFilter, limit);
+    var byType  = rows.GroupBy(r => r.FeedbackType).ToDictionary(g => g.Key, g => g.Count());
+    var bySource = rows.GroupBy(r => r.SourceType).ToDictionary(g => g.Key, g => g.Count());
+
+    return Results.Ok(new
+    {
+        success = true,
+        data = new
+        {
+            items = rows.Select(r => new
+            {
+                type       = r.FeedbackType,
+                sourceType = r.SourceType,
+                recordedAt = r.RecordedAt,
+                idRef      = r.CommitmentIdHash[..Math.Min(8, r.CommitmentIdHash.Length)],
+                confidence = r.ConfidenceAtFeedback,
+                comment    = r.Comment,
+            }),
+            total     = rows.Count,
+            breakdown = new { byType, bySource },
+        },
+        requestId = Guid.NewGuid(),
+    });
+})
+.WithName("GetAdminFeedback")
+.WithOpenApi();
+
+// GET /api/v1/admin/signal-profiles — per-user pipeline tuning state
+api.MapGet("/admin/signal-profiles", async (IFeedbackRepository feedbackRepo) =>
+{
+    var all = await feedbackRepo.GetRecentAsync(limit: 2000);
+
+    var users = all
+        .GroupBy(r => r.PartitionKey)
+        .Select(g =>
+        {
+            var total      = g.Count();
+            var fpCount    = g.Count(r => r.FeedbackType == "FalsePositive");
+            var fpRate     = total > 0 ? (double)fpCount / total : 0.0;
+            var confAdj    = fpRate > 0.60 ? 0.15 : fpRate > 0.30 ? 0.05 : 0.0;
+            var suppressed = g.Where(r => r.FeedbackType == "FalsePositive")
+                              .Select(r => r.TitleFingerprint)
+                              .Distinct().Count();
+            return new
+            {
+                userRef              = g.Key[..Math.Min(8, g.Key.Length)],
+                totalFeedback        = total,
+                fpRate,
+                suppressedCount      = suppressed,
+                confidenceAdjustment = confAdj,
+                lastFeedbackAt       = g.Max(r => r.RecordedAt),
+            };
+        })
+        .OrderByDescending(u => u.totalFeedback)
+        .ToList();
+
+    var avgFpRate  = users.Count > 0 ? users.Average(u => u.fpRate) : 0.0;
+    var avgConfAdj = users.Count > 0 ? users.Average(u => u.confidenceAdjustment) : 0.0;
+    var totalSup   = users.Sum(u => u.suppressedCount);
+
+    return Results.Ok(new
+    {
+        success = true,
+        data = new
+        {
+            users,
+            aggregate = new
+            {
+                userCount               = users.Count,
+                avgFpRate,
+                avgConfidenceAdjustment = avgConfAdj,
+                totalSuppressed         = totalSup,
+            },
+        },
+        requestId = Guid.NewGuid(),
+    });
+})
+.WithName("GetAdminSignalProfiles")
+.WithOpenApi();
+
+// GET /api/v1/admin/insights — AI-generated analysis of extraction performance
+api.MapGet("/admin/insights", async (
+    IConfiguration     config,
+    IAppInsightsClient insights) =>
+{
+    var endpoint   = config["AZURE_OPENAI_ENDPOINT"] ?? Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT");
+    var key        = config["AZURE_OPENAI_KEY"]      ?? Environment.GetEnvironmentVariable("AZURE_OPENAI_KEY");
+    var deployment = config["AZURE_OPENAI_DEPLOYMENT"] ?? "gpt-4o";
+
+    string insightText = "OpenAI endpoint not configured — admin insights unavailable.";
+
+    if (endpoint is not null && key is not null)
+    {
+        try
+        {
+            var aiClient = new AzureOpenAIClient(new Uri(endpoint), new Azure.AzureKeyCredential(key));
+            var client   = aiClient.GetChatClient(deployment);
+            var response = await client.CompleteChatAsync(
+            [
+                new SystemChatMessage("You are an AI analyst for a commitment tracking system. Your job is to produce actionable insights about extraction quality, user engagement, and system performance based on provided metrics."),
+                new UserChatMessage("""
+                    Based on what you know about commitment extraction systems using NLP, Teams, email, and ADO signals:
+                    Provide 3-5 concise, actionable insights about what metrics would be most important to track and what thresholds indicate healthy extraction quality.
+                    Format as a bulleted list. Be specific and practical.
+                    """)
+            ]);
+            insightText = response.Value.Content[0].Text;
+        }
+        catch (Exception ex)
+        {
+            app.Logger.LogWarning(ex, "Admin insights generation failed");
+        }
+    }
+
+    insights.TrackUserAction("admin-insights-generated", "admin", "admin", new Dictionary<string, string>());
+
+    return Results.Ok(new
+    {
+        success     = true,
+        insights    = insightText,
+        generatedAt = DateTimeOffset.UtcNow,
+        requestId   = Guid.NewGuid(),
+    });
+})
+.WithName("GetAdminInsights")
 .WithOpenApi();
 
 app.Run();

@@ -194,4 +194,16 @@ public sealed class ExtractionOrchestrator : IExtractionOrchestrator
 
         return upserted;
     }
+
+    internal static string ComputeTitleFingerprint(string title)
+    {
+        var normalized = new string(title.ToLowerInvariant()
+            .Select(c => char.IsLetterOrDigit(c) || c == ' ' ? c : ' ')
+            .ToArray());
+        var tokens = normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var joined = string.Join(" ", tokens.OrderBy(t => t));
+        return Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(joined)))[..16];
+    }
 }

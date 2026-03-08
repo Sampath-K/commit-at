@@ -12,7 +12,14 @@ import {
   Tooltip,
   tokens,
   makeStyles,
+  Dialog,
+  DialogSurface,
+  DialogTitle,
+  DialogBody,
+  DialogActions,
+  Textarea,
 } from '@fluentui/react-components';
+import { recordFeedback } from '../../api/commitApi';
 import { useSpring, animated } from '@react-spring/web';
 import { useReducedMotion } from '../../hooks/useReducedMotion';
 import { SPRING_CONFIGS } from '../../config/psychology.config';
@@ -211,6 +218,10 @@ function CommitCard({
   const ownerTeam = TEAM_BY_USER[commitment.owner];
   const [isDone, setIsDone] = useState(commitment.status === 'done');
   const [markingDone, setMarkingDone] = useState(false);
+  const [feedbackState, setFeedbackState] = useState<'idle' | 'confirmed' | 'dismissed'>('idle');
+  const [feedbackMsg, setFeedbackMsg] = useState('');
+  const [showCommentDialog, setShowCommentDialog] = useState(false);
+  const [thumbsDownComment, setThumbsDownComment] = useState('');
 
   const handleMarkDone = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -230,10 +241,43 @@ function CommitCard({
     }
   }, [commitment.owner, commitment.id]);
 
+  const handleFeedback = useCallback(async (type: 'Confirm' | 'FalsePositive', e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!currentUserId) return;
+    if (type === 'FalsePositive') {
+      setShowCommentDialog(true);
+      return;
+    }
+    try {
+      await recordFeedback(currentUserId, commitment.id, type);
+      setFeedbackState('confirmed');
+      setFeedbackMsg('Marked as useful');
+      setTimeout(() => setFeedbackState('idle'), 2500);
+    } catch {
+      // Best-effort
+    }
+  }, [currentUserId, commitment.id]);
+
+  const handleThumbsDownSubmit = useCallback(async () => {
+    setShowCommentDialog(false);
+    if (!currentUserId) return;
+    try {
+      await recordFeedback(currentUserId, commitment.id, 'FalsePositive', undefined, thumbsDownComment.trim() || undefined);
+      setFeedbackMsg("Won't show similar tasks");
+      setFeedbackState('dismissed');
+    } catch {
+      // Best-effort
+    }
+    setThumbsDownComment('');
+  }, [currentUserId, commitment.id, thumbsDownComment]);
+
   const spring = useSpring({
     config: SPRING_CONFIGS.smooth,
     from: { opacity: 0, translateY: reducedMotion ? 0 : 8 },
-    to:   { opacity: isDone ? 0 : 1, translateY: isDone ? -8 : 0 },
+    to:   {
+      opacity: (isDone || feedbackState === 'dismissed') ? 0 : 1,
+      translateY: (isDone || feedbackState === 'dismissed') ? -8 : 0,
+    },
     delay: reducedMotion ? 0 : delay,
   });
 
@@ -317,16 +361,31 @@ function CommitCard({
             </div>
           }
         />
-        {/* Mark as Done button */}
-        {!isDone && (
-          <div style={{ padding: '0 12px 10px', display: 'flex', justifyContent: 'flex-end' }}>
-            <Button
-              appearance="subtle"
-              size="small"
-              disabled={markingDone}
-              onClick={handleMarkDone}
-              style={{ color: tokens.colorStatusSuccessForeground1 }}
-            >
+        {/* Action row: thumbs feedback + Done button */}
+        {!isDone && feedbackState !== 'dismissed' && (
+          <div style={{ padding: '0 12px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', gap: '2px', alignItems: 'center' }}>
+              {feedbackState === 'confirmed' ? (
+                <Text size={100} style={{ color: tokens.colorStatusSuccessForeground1 }}>{feedbackMsg}</Text>
+              ) : (
+                <>
+                  <Tooltip content="Useful — keep tracking" relationship="description">
+                    <Button appearance="transparent" size="small" aria-label="Mark as useful"
+                      onClick={(e) => void handleFeedback('Confirm', e)} style={{ minWidth: 'unset', padding: '0 4px' }}>
+                      👍
+                    </Button>
+                  </Tooltip>
+                  <Tooltip content="Not a real task — won't show again" relationship="description">
+                    <Button appearance="transparent" size="small" aria-label="Not a real task"
+                      onClick={(e) => void handleFeedback('FalsePositive', e)} style={{ minWidth: 'unset', padding: '0 4px' }}>
+                      👎
+                    </Button>
+                  </Tooltip>
+                </>
+              )}
+            </div>
+            <Button appearance="subtle" size="small" disabled={markingDone} onClick={handleMarkDone}
+              style={{ color: tokens.colorStatusSuccessForeground1 }}>
               {markingDone ? '...' : '✓ Done'}
             </Button>
           </div>
@@ -353,6 +412,26 @@ function CommitCard({
           </div>
         )}
       </Card>
+
+      {/* Thumbs-down comment dialog */}
+      <Dialog open={showCommentDialog} onOpenChange={(_, d) => { if (!d.open) { setShowCommentDialog(false); setThumbsDownComment(''); } }}>
+        <DialogSurface onClick={(e) => e.stopPropagation()}>
+          <DialogTitle>Why isn't this a real task?</DialogTitle>
+          <DialogBody>
+            <Textarea
+              placeholder="Optional — helps improve extraction (max 200 chars)"
+              value={thumbsDownComment}
+              onChange={(_, d) => setThumbsDownComment(d.value.slice(0, 200))}
+              resize="vertical"
+              style={{ width: '100%', marginTop: '8px' }}
+            />
+          </DialogBody>
+          <DialogActions>
+            <Button appearance="subtle" onClick={() => { setShowCommentDialog(false); setThumbsDownComment(''); }}>Cancel</Button>
+            <Button appearance="primary" onClick={() => void handleThumbsDownSubmit()}>Submit</Button>
+          </DialogActions>
+        </DialogSurface>
+      </Dialog>
     </animated.div>
   );
 }

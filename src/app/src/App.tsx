@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { CommitPane } from './components/core/CommitPane';
 import { CascadeView } from './components/core/CascadeView';
+import { RescanModal } from './components/core/RescanModal';
+import { AdminDashboard } from './pages/AdminDashboard';
 import type { ApiResponse, CommitmentRecord } from './types/api';
 import { API_BASE } from './config/api.config';
 
@@ -29,6 +31,7 @@ interface AppProps {
 export function App({ userId, authToken }: AppProps): JSX.Element {
   const [selected, setSelected] = useState<CommitmentRecord | null>(null);
   const queryClient = useQueryClient();
+  const isAdmin = new URLSearchParams(window.location.search).get('admin') === 'true';
 
   const { data: commitments = [], isLoading } = useQuery({
     queryKey: ['commitments', userId],
@@ -63,6 +66,10 @@ export function App({ userId, authToken }: AppProps): JSX.Element {
     return () => es.close();
   }, [userId, queryClient]);
 
+  if (isAdmin) {
+    return <AdminDashboard authToken={authToken} />;
+  }
+
   if (selected) {
     return (
       <CascadeView
@@ -75,16 +82,30 @@ export function App({ userId, authToken }: AppProps): JSX.Element {
   }
 
   return (
-    <CommitPane
-      commitments={commitments}
-      isLoading={isLoading}
-      currentUserId={userId}
-      onCommitmentClick={(c) => {
-        // Drill into cascade view for in-progress or items that block others
-        if (c.status === 'in-progress' || c.blocks.length > 0) {
-          setSelected(c);
-        }
-      }}
-    />
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      {/* Top action bar: Rescan + Admin link */}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '4px 12px 0', gap: '4px' }}>
+        <RescanModal
+          userId={userId}
+          authToken={authToken}
+          onRescanComplete={() => void queryClient.invalidateQueries({ queryKey: ['commitments', userId] })}
+        />
+        <a href="?admin=true" style={{ fontSize: '11px', color: '#666', textDecoration: 'none', alignSelf: 'center' }}>
+          Admin
+        </a>
+      </div>
+      <div style={{ flex: 1, overflow: 'auto' }}>
+        <CommitPane
+          commitments={commitments}
+          isLoading={isLoading}
+          currentUserId={userId}
+          onCommitmentClick={(c) => {
+            if (c.status === 'in-progress' || c.blocks.length > 0) {
+              setSelected(c);
+            }
+          }}
+        />
+      </div>
+    </div>
   );
 }
