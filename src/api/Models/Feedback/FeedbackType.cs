@@ -1,6 +1,9 @@
+using System.Text.Json.Serialization;
+
 namespace CommitApi.Models.Feedback;
 
 /// <summary>Type of feedback a user provides on a commitment.</summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum FeedbackType
 {
     /// <summary>The commitment was not a real commitment (false positive).</summary>

@@ -131,7 +131,7 @@ export function RescanModal({ userId, authToken, onRescanComplete }: RescanModal
             )}
           </DialogContent>
           <DialogActions>
-            <Button appearance="secondary" onClick={() => setOpen(false)}>Cancel</Button>
+            <Button appearance="secondary" onClick={() => { setOpen(false); setResult(null); }}>Cancel</Button>
             <Button
               appearance="primary"
               disabled={running || sources.size === 0}

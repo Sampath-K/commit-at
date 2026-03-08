@@ -1,17 +1,16 @@
 /**
- * SCENARIO: CommitPane — commitment card rendering and team affiliation pills
+ * SCENARIO: CommitPane — commitment card rendering, team affiliation pills,
+ *           feedback flow (thumbs up/down + comment dialog), Mark Done,
+ *           view mode switching, and all 6 source type icons.
  *
  * Key broken scenario documented here:
  *   KNOWN DESIGN GAP: Team pills (green/purple) do NOT appear on Alex's own board
  *   because ALL 9 seeded commitments are owned by Alex (owner === currentUserId).
  *   Pills only render for commitment.owner !== currentUserId.
  *   Cross-team labels ARE visible in CascadeView chain items (teamFromTaskId).
- *
- * Tests verify both the positive path (cross-team pill shows) and
- * the design gap (self-owned cards have no pill).
  */
 import React from 'react';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { CommitPane } from '../components/core/CommitPane';
 import { makeCommitment, ALEX_OID, MARCUS_OID, SARAH_OID } from './helpers';
 
@@ -31,23 +30,46 @@ jest.mock('@fluentui/react-components', () => {
     ({ children, ...props }: Record<string, unknown>) =>
       React.createElement(tag, props, children);
 
+  // Dialog renders children inline when open=true
+  const Dialog = ({ children, open }: { children: unknown; open?: boolean }) =>
+    open ? React.createElement('div', { 'data-dialog': 'true' }, children) : null;
+  const DialogSurface  = el('div');
+  const DialogTitle    = el('div');
+  const DialogBody     = el('div');
+  const DialogActions  = el('div');
+  const Textarea = ({
+    value, onChange, placeholder, ...props
+  }: { value?: string; onChange?: (e: unknown, d: { value: string }) => void; placeholder?: string; [k: string]: unknown }) =>
+    React.createElement('textarea', {
+      value,
+      placeholder,
+      onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => onChange?.(e, { value: e.target.value }),
+      ...props,
+    });
+
   return {
-    makeStyles:  () => () => ({}),
-    tokens:      new Proxy({}, { get: () => '' }),
-    Card:        ({ onClick, children, ...props }: Record<string, unknown>) =>
-                   React.createElement('div', { onClick, ...props }, children),
-    CardHeader:  ({ header, description, action }: Record<string, unknown>) =>
-                   React.createElement('div', {}, header, description, action),
-    Text:        ({ children, truncate: _t, ...props }: Record<string, unknown>) =>
-                   React.createElement('span', props, children),
-    Badge:       ({ children, ...props }: Record<string, unknown>) =>
-                   React.createElement('span', { 'data-badge': 'true', ...props }, children),
-    Button:      ({ onClick, children, href, ...props }: Record<string, unknown>) =>
-                   React.createElement(href ? 'a' : 'button', { onClick, href, ...props }, children),
-    Divider:     el('hr'),
-    Skeleton:    el('div'),
+    makeStyles:   () => () => ({}),
+    tokens:       new Proxy({}, { get: () => '' }),
+    Card:         ({ onClick, children, ...props }: Record<string, unknown>) =>
+                    React.createElement('div', { onClick, ...props }, children),
+    CardHeader:   ({ header, description, action }: Record<string, unknown>) =>
+                    React.createElement('div', {}, header, description, action),
+    Text:         ({ children, truncate: _t, ...props }: Record<string, unknown>) =>
+                    React.createElement('span', props, children),
+    Badge:        ({ children, ...props }: Record<string, unknown>) =>
+                    React.createElement('span', { 'data-badge': 'true', ...props }, children),
+    Button:       ({ onClick, children, href, disabled, ...props }: Record<string, unknown>) =>
+                    React.createElement(href ? 'a' : 'button', { onClick, href, disabled, ...props }, children),
+    Divider:      el('hr'),
+    Skeleton:     el('div'),
     SkeletonItem: el('div'),
-    Tooltip:     ({ children }: { children: unknown }) => children,
+    Tooltip:      ({ children }: { children: unknown }) => children,
+    Dialog,
+    DialogSurface,
+    DialogTitle,
+    DialogBody,
+    DialogActions,
+    Textarea,
   };
 });
 
@@ -240,3 +262,329 @@ describe('CommitPane — Eisenhower quadrant grouping', () => {
     expect(screen.queryByText('commitPane.quadrants.notUrgentNotImportant')).not.toBeInTheDocument();
   });
 });
+
+// ─── View mode switching ──────────────────────────────────────────────────────
+
+describe('CommitPane — view mode switching', () => {
+  it('renders Priority, Project, Progress tab buttons', () => {
+    render(<CommitPane commitments={[makeCommitment()]} isLoading={false} />);
+    expect(screen.getByText('Priority')).toBeInTheDocument();
+    expect(screen.getByText('Project')).toBeInTheDocument();
+    expect(screen.getByText(/Progress/)).toBeInTheDocument();
+  });
+
+  it('switching to Project view groups by projectContext', () => {
+    const c1 = makeCommitment({ id: 'p1', projectContext: 'Alpha', priority: 'urgent-important' });
+    const c2 = makeCommitment({ id: 'p2', projectContext: 'Beta',  priority: 'not-urgent-important' });
+    render(<CommitPane commitments={[c1, c2]} isLoading={false} />);
+    fireEvent.click(screen.getByText('Project'));
+    // Both cards still render in project view
+    expect(screen.getByTestId('commit-card-p1')).toBeInTheDocument();
+    expect(screen.getByTestId('commit-card-p2')).toBeInTheDocument();
+  });
+
+  it('switching back to Priority view shows quadrant headers', () => {
+    const c = makeCommitment({ priority: 'urgent-important' });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    fireEvent.click(screen.getByText('Project'));
+    fireEvent.click(screen.getByText('Priority'));
+    expect(screen.getByText('commitPane.quadrants.urgentImportant')).toBeInTheDocument();
+  });
+});
+
+// ─── Feedback — thumbs up (Confirm) ──────────────────────────────────────────
+
+describe('CommitPane — thumbs up feedback', () => {
+  beforeEach(() => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ success: true }) });
+  });
+
+  it('renders the Mark as useful button', () => {
+    const c = makeCommitment({ status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    expect(screen.getByRole('button', { name: 'Mark as useful' })).toBeInTheDocument();
+  });
+
+  it('clicking thumbs up calls feedback API with Confirm type', async () => {
+    const c = makeCommitment({ id: 'rbs-up-001', status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Mark as useful' }));
+    });
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/v1/commitments/rbs-up-001/feedback'),
+        expect.objectContaining({
+          method: 'POST',
+          body: expect.stringContaining('"type":"Confirm"'),
+        })
+      )
+    );
+  });
+
+  it('hides feedback buttons on done cards', () => {
+    const c = makeCommitment({ status: 'done' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    expect(screen.queryByTitle('Mark as useful')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Not a real task')).not.toBeInTheDocument();
+  });
+});
+
+// ─── Feedback — thumbs down (FalsePositive + comment dialog) ─────────────────
+
+describe('CommitPane — thumbs down feedback with comment dialog', () => {
+  beforeEach(() => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ success: true }) });
+  });
+
+  it('renders the Not a real task button', () => {
+    const c = makeCommitment({ status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    expect(screen.getByRole('button', { name: 'Not a real task' })).toBeInTheDocument();
+  });
+
+  it('clicking thumbs down opens the comment dialog', () => {
+    const c = makeCommitment({ status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Not a real task' }));
+    expect(screen.getByText("Why isn't this a real task?")).toBeInTheDocument();
+  });
+
+  it('dialog has a textarea for entering a comment', () => {
+    const c = makeCommitment({ status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Not a real task' }));
+    expect(screen.getByPlaceholderText(/helps improve extraction/i)).toBeInTheDocument();
+  });
+
+  it('Cancel closes the dialog without calling the API', () => {
+    const c = makeCommitment({ status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Not a real task' }));
+    fireEvent.click(screen.getByText('Cancel'));
+    expect(screen.queryByText("Why isn't this a real task?")).not.toBeInTheDocument();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it('Submit calls feedback API with FalsePositive type and the entered comment', async () => {
+    const c = makeCommitment({ id: 'rbs-down-001', status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Not a real task' }));
+    fireEvent.change(screen.getByPlaceholderText(/helps improve extraction/i), {
+      target: { value: 'This is just a meeting invite' },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Submit'));
+    });
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/v1/commitments/rbs-down-001/feedback'),
+        expect.objectContaining({
+          method: 'POST',
+          body: expect.stringContaining('"type":"FalsePositive"'),
+        })
+      )
+    );
+    expect((global.fetch as jest.Mock).mock.calls[0][1].body).toContain('This is just a meeting invite');
+  });
+
+  it('Submit with blank comment still calls API (comment is optional)', async () => {
+    const c = makeCommitment({ id: 'rbs-down-002', status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Not a real task' }));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Submit'));
+    });
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/v1/commitments/rbs-down-002/feedback'),
+        expect.anything()
+      )
+    );
+  });
+
+  it('dialog closes after Submit', async () => {
+    const c = makeCommitment({ status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Not a real task' }));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Submit'));
+    });
+    expect(screen.queryByText("Why isn't this a real task?")).not.toBeInTheDocument();
+  });
+});
+
+// ─── Mark Done ────────────────────────────────────────────────────────────────
+
+describe('CommitPane — Mark Done', () => {
+  beforeEach(() => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+  });
+
+  it('renders the Done button on a pending card', () => {
+    const c = makeCommitment({ status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    expect(screen.getByText('✓ Done')).toBeInTheDocument();
+  });
+
+  it('clicking Done calls PATCH endpoint with status=done', async () => {
+    const c = makeCommitment({ id: 'rbs-done-001', status: 'pending', owner: ALEX_OID });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    await act(async () => {
+      fireEvent.click(screen.getByText('✓ Done'));
+    });
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining(`/api/v1/commitments/${ALEX_OID}/rbs-done-001`),
+        expect.objectContaining({
+          method: 'PATCH',
+          body: expect.stringContaining('"status":"done"'),
+        })
+      )
+    );
+  });
+
+  it('does not render Done button on already-done cards', () => {
+    const c = makeCommitment({ status: 'done' });
+    render(<CommitPane commitments={[c]} isLoading={false} currentUserId={ALEX_OID} />);
+    expect(screen.queryByText('✓ Done')).not.toBeInTheDocument();
+  });
+});
+
+// ─── Source type icons (all 6 extraction sources) ────────────────────────────
+
+describe('CommitPane — source type icons for all 6 intent-detection sources', () => {
+  const SOURCES: Array<{ type: CommitmentRecord['source']['type']; icon: string }> = [
+    { type: 'meeting',  icon: '📹' },
+    { type: 'chat',     icon: '💬' },
+    { type: 'email',    icon: '📧' },
+    { type: 'ado',      icon: '🔧' },
+    { type: 'drive',    icon: '📄' },
+    { type: 'planner',  icon: '📋' },
+  ];
+
+  SOURCES.forEach(({ type, icon }) => {
+    it(`renders ${icon} icon for source type "${type}"`, () => {
+      const c = makeCommitment({
+        source: { type, url: `https://example.com/${type}`, timestamp: '2026-03-01T09:00:00Z' },
+      });
+      render(<CommitPane commitments={[c]} isLoading={false} />);
+      expect(screen.getByText(icon)).toBeInTheDocument();
+    });
+  });
+});
+
+// ─── Intent detection scenarios (source-driven extraction) ───────────────────
+
+describe('CommitPane — intent detection scenarios', () => {
+  it('meeting transcript commitment: renders title + meeting source icon', () => {
+    const c = makeCommitment({
+      title: 'Deliver BizChat Copilot Skill GA package by March 10',
+      source: { type: 'meeting', url: 'https://teams.microsoft.com/l/meet/1', timestamp: '2026-03-01T09:00:00Z' },
+      priority: 'urgent-important',
+    });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    expect(screen.getByText('Deliver BizChat Copilot Skill GA package by March 10')).toBeInTheDocument();
+    expect(screen.getByText('📹')).toBeInTheDocument();
+  });
+
+  it('chat commitment: renders title + chat source icon', () => {
+    const c = makeCommitment({
+      title: 'Send final API contract diff to SDK team by EOD Friday',
+      source: { type: 'chat', url: 'https://teams.microsoft.com/l/chat/0', timestamp: '2026-03-01T09:00:00Z' },
+    });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    expect(screen.getByText('Send final API contract diff to SDK team by EOD Friday')).toBeInTheDocument();
+    expect(screen.getByText('💬')).toBeInTheDocument();
+  });
+
+  it('email commitment: renders title + email source icon', () => {
+    const c = makeCommitment({
+      title: 'Unblock dashboard by sharing Viva Insights capacity data',
+      source: { type: 'email', url: 'https://outlook.office.com/mail/inbox/id/AAQk', timestamp: '2026-03-01T09:00:00Z' },
+    });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    expect(screen.getByText('Unblock dashboard by sharing Viva Insights capacity data')).toBeInTheDocument();
+    expect(screen.getByText('📧')).toBeInTheDocument();
+  });
+
+  it('ADO work item commitment: renders title + ADO source icon', () => {
+    const c = makeCommitment({
+      title: 'Fix p99 latency regression in semantic ranking before GA',
+      source: { type: 'ado', url: 'https://dev.azure.com/contoso/BizChat/_workitems/edit/18847', timestamp: '2026-03-01T09:00:00Z' },
+    });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    expect(screen.getByText('Fix p99 latency regression in semantic ranking before GA')).toBeInTheDocument();
+    expect(screen.getByText('🔧')).toBeInTheDocument();
+  });
+
+  it('Drive/SharePoint commitment: renders title + drive source icon', () => {
+    const c = makeCommitment({
+      title: 'Update GA readiness checklist in SharePoint with latency test results',
+      source: { type: 'drive', url: 'https://contoso.sharepoint.com/sites/BizChat', timestamp: '2026-03-01T09:00:00Z' },
+    });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    expect(screen.getByText('Update GA readiness checklist in SharePoint with latency test results')).toBeInTheDocument();
+    expect(screen.getByText('📄')).toBeInTheDocument();
+  });
+
+  it('Planner task commitment: renders title + planner source icon', () => {
+    const c = makeCommitment({
+      title: 'Review and approve SDK integration PR before Thursday standup',
+      source: { type: 'planner', url: 'https://tasks.office.com/contoso/en-US/Home/Planner', timestamp: '2026-03-01T09:00:00Z' },
+    });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    expect(screen.getByText('Review and approve SDK integration PR before Thursday standup')).toBeInTheDocument();
+    expect(screen.getByText('📋')).toBeInTheDocument();
+  });
+
+  it('high-impact urgent commitment gets placed in Act Today (urgent-important) quadrant', () => {
+    const c = makeCommitment({
+      title: 'Fix critical P0 outage',
+      priority: 'urgent-important',
+      impactScore: 90,
+    });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    expect(screen.getByText('commitPane.quadrants.urgentImportant')).toBeInTheDocument();
+    expect(screen.getByText('Fix critical P0 outage')).toBeInTheDocument();
+  });
+
+  it('planner task gets placed in Schedule (not-urgent-important) quadrant', () => {
+    const c = makeCommitment({
+      title: 'Review quarterly OKRs',
+      priority: 'not-urgent-important',
+      source: { type: 'planner', url: 'https://tasks.office.com/', timestamp: '2026-03-01T09:00:00Z' },
+    });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    expect(screen.getByText('commitPane.quadrants.notUrgentImportant')).toBeInTheDocument();
+  });
+
+  it('completion item (ItemKind=completion) still renders when status=done', () => {
+    const c = makeCommitment({
+      title: 'Merged BizChat PR #9201',
+      status: 'done',
+      source: { type: 'ado', url: 'https://dev.azure.com/contoso/BizChat/_git/BizChat/pullrequest/9201', timestamp: '2026-03-01T09:00:00Z' },
+    });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    // Done items appear in Progress view (as completionCard, not CommitCard)
+    fireEvent.click(screen.getByText('Progress'));
+    expect(screen.getByText('Merged BizChat PR #9201')).toBeInTheDocument();
+  });
+
+  it('overdue commitment shows overdue indicator', () => {
+    const pastDate = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const c = makeCommitment({ dueAt: pastDate, status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    expect(screen.getByText(/commitPane\.card\.overdue/)).toBeInTheDocument();
+  });
+
+  it('future due date shows "due in X days"', () => {
+    const futureDate = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+    const c = makeCommitment({ dueAt: futureDate, status: 'pending' });
+    render(<CommitPane commitments={[c]} isLoading={false} />);
+    expect(screen.getByText(/commitPane\.card\.dueIn/)).toBeInTheDocument();
+  });
+});
+
+// ─── Type import for source scenarios ────────────────────────────────────────
+import type { CommitmentRecord } from '../types/api';
